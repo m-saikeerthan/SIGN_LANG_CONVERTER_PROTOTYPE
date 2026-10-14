@@ -16,10 +16,7 @@ load_dotenv()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 if not GEMINI_API_KEY:
-    raise ValueError(
-        "GEMINI_API_KEY not found! "
-        "Create a .env file in the project root with: GEMINI_API_KEY=your_key_here"
-    )
+    print("[ISL] Note: GEMINI_API_KEY not found or empty. System will run in 100% offline heuristic NLP mode.")
 
 GRAMMAR_PROMPT = "Words: {words}\nOutput:"
 
@@ -56,17 +53,67 @@ _VERB_HINTS = {
 }
 
 
+_IDIOMATIC_PATTERNS = {
+    ('HELLO',): "Hello!",
+    ('CONGRATULATIONS',): "Congratulations!",
+    ('SORRY',): "I am sorry.",
+    ('QUIET',): "Please be quiet.",
+    ('FINISHED',): "It is finished.",
+    ('YES',): "Yes.",
+    ('NO',): "No.",
+    ('THANK', 'YOU'): "Thank you.",
+    ('PLEASE', 'HELP'): "Please help me.",
+    ('HELP', 'PLEASE'): "Please help me.",
+    ('HELP',): "Please help me.",
+    ('TAKE TIME',): "Please take your time.",
+    ('TAKE', 'TIME'): "Please take your time.",
+    ('ME', 'HAPPY', 'MEET', 'YOU'): "I am happy to meet you.",
+    ('I', 'HAPPY', 'MEET', 'YOU'): "I am happy to meet you.",
+    ('I', 'YOU', 'LIKE'): "I like you.",
+    ('I', 'LIKE', 'YOU'): "I like you.",
+    ('ME', 'LIKE', 'YOU'): "I like you.",
+    ('YOU', 'GO', 'WHERE'): "Where are you going?",
+    ('WHERE', 'YOU', 'GO'): "Where are you going?",
+    ('I', 'WANT', 'FOOD'): "I want food.",
+    ('ME', 'WANT', 'FOOD'): "I want food.",
+    ('I', 'EAT', 'FOOD'): "I want to eat food.",
+    ('I', 'THIRSTY'): "I am thirsty.",
+    ('ME', 'THIRSTY'): "I am thirsty.",
+    ('I', 'HUNGRY'): "I am hungry.",
+    ('ME', 'HUNGRY'): "I am hungry.",
+    ('I', 'COLD'): "I am feeling cold.",
+    ('ME', 'COLD'): "I am feeling cold.",
+    ('I', 'ANGRY'): "I am angry.",
+    ('ME', 'ANGRY'): "I am angry.",
+    ('WE', 'TOGETHER', 'WORK'): "We work together.",
+    ('WE', 'PLAY', 'TOGETHER'): "We play together.",
+}
+
+
 def _local_isl_to_english(words):
     """
     Smart local ISL→English converter (no API needed).
-    Implements basic SOV→SVO reordering + pronoun normalization.
+    Implements idiomatic matching, SOV→SVO reordering, and pronoun normalization.
     """
     if not words:
         return ""
 
-    words_upper = [w.upper() for w in words]
+    words_upper = tuple(w.upper() for w in words)
 
-    # Identify subject (first pronoun/noun), verb (last verb-hint), object (rest)
+    # 1. Exact idiomatic match
+    if words_upper in _IDIOMATIC_PATTERNS:
+        return _IDIOMATIC_PATTERNS[words_upper]
+
+    # 2. Single word fallback
+    if len(words) == 1:
+        w = words[0].upper()
+        if w in ('HELLO', 'CONGRATULATIONS'):
+            return f"{w.capitalize()}!"
+        if w in ('YES', 'NO', 'SORRY', 'HELP', 'QUIET', 'FINISHED'):
+            return _IDIOMATIC_PATTERNS.get((w,), f"{w.capitalize()}.")
+        return f"{words[0].capitalize()}."
+
+    # 3. Identify subject, verb, and object
     subject = None
     verb = None
     verb_idx = None
@@ -90,7 +137,6 @@ def _local_isl_to_english(words):
     if verb_idx is not None:
         obj_words = [w for j, w in enumerate(remaining) if j != verb_idx]
     else:
-        # No clear verb found — just normalize and join
         obj_words = remaining
 
     # Normalize object words
@@ -126,19 +172,73 @@ SIGN_DESCRIPTION_PROMPT = (
     "Words: {words}"
 )
 
+_OFFLINE_HINDI_MAP = {
+    'hello': 'नमस्ते।',
+    'i like you': 'मैं आपको पसंद करता हूँ।',
+    'i am happy to meet you': 'मुझे आपसे मिलकर खुशी हुई।',
+    'where are you going': 'आप कहाँ जा रहे हैं?',
+    'i want food': 'मुझे खाना चाहिए।',
+    'please help': 'कृपया मदद करें।',
+    'thank you': 'धन्यवाद।',
+    'congratulations': 'बधाई हो!',
+    'i love you': 'मैं तुमसे प्यार करता हूँ।',
+    'sorry': 'मुझे माफ करें।',
+    'eat': 'खाना',
+    'work': 'काम',
+    'phone': 'फ़ोन',
+    'quiet': 'शांत रहें।',
+    'finished': 'समाप्त।',
+    'all': 'सभी',
+    'and': 'और',
+    'angry': 'गुस्सा',
+    'cold': 'ठंड',
+    'go': 'जाओ',
+    'hear': 'सुनना',
+    'heart': 'दिल',
+    'home': 'घर',
+    'know': 'जानना',
+    'more': 'अधिक',
+    'need': 'जरूरत',
+    'no': 'नहीं।',
+    'yes': 'हाँ।',
+    'play': 'खेलना',
+    'think': 'सोचना',
+    'thirsty': 'प्यासा',
+    'together': 'एक साथ',
+    'wait': 'प्रतीक्षा करें।',
+    'why': 'क्यों?',
+    'take time': 'समय लें।',
+}
+
+
+def _get_offline_hindi(text):
+    if not text:
+        return ""
+    clean = text.lower().strip().rstrip('.!?')
+    if clean in _OFFLINE_HINDI_MAP:
+        return _OFFLINE_HINDI_MAP[clean]
+    # Word-by-word fallback
+    words = clean.split()
+    translated = [_OFFLINE_HINDI_MAP.get(w, w) for w in words]
+    return " ".join(translated)
+
 
 class SentenceProcessor:
     """Handles grammar correction, Hindi translation, TTS, and sign descriptions."""
 
     def __init__(self):
-        try:
-            self._client = genai.Client(api_key=GEMINI_API_KEY)
-            self._model_names = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"]
-            self._model_name = self._model_names[0]
-            print(f"[ISL] Gemini Client ready with model {self._model_name}.")
-        except Exception as e:
-            print(f"[ISL] Warning: Failed to init Gemini client: {e}")
-            self._client = None
+        self._client = None
+        if GEMINI_API_KEY:
+            try:
+                self._client = genai.Client(api_key=GEMINI_API_KEY)
+                self._model_names = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash"]
+                self._model_name = self._model_names[0]
+                print(f"[ISL] Gemini Client ready with model {self._model_name}.")
+            except Exception as e:
+                print(f"[ISL] Warning: Failed to init Gemini client: {e}")
+                self._client = None
+        else:
+            print("[ISL] Gemini Client disabled (running offline).")
             
         # TTS Setup (safe init)
         self._tts_engine = None
@@ -198,21 +298,24 @@ class SentenceProcessor:
         self._sentence_cache[cache_key] = fallback
         return fallback
 
+
     def translate_to_hindi(self, english_sentence):
-        """Translate English sentence to Hindi via Gemini."""
-        if not self._client or not english_sentence:
+        """Translate English sentence to Hindi via Gemini (with offline dictionary fallback)."""
+        if not english_sentence:
             return ""
-        try:
-            prompt = HINDI_PROMPT.format(sentence=english_sentence)
-            response = self._client.models.generate_content(
-                model=self._model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(temperature=0.2)
-            )
-            return response.text.strip()
-        except Exception as e:
-            print(f"[ISL] Hindi translation failed/limits reached: {e}")
-            return ""
+        if self._client:
+            try:
+                prompt = HINDI_PROMPT.format(sentence=english_sentence)
+                response = self._client.models.generate_content(
+                    model=self._model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(temperature=0.2)
+                )
+                return response.text.strip()
+            except Exception as e:
+                print(f"[ISL] Hindi translation API fallback: {e}")
+
+        return _get_offline_hindi(english_sentence)
 
     def correct_and_translate(self, words):
         """Full pipeline: correct grammar → translate to Hindi."""

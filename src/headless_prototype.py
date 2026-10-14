@@ -2,12 +2,15 @@
 Headless Standalone ISL Detection & Voice Output Engine for Wall Prototype.
 Runs continuously on boot without GUI display windows.
 Captures camera video, tracks hands, classifies gestures, formats sentences,
-and delivers voice speech output over the connected speaker.
+and delivers voice speech output and acoustic feedback over the connected speaker.
 """
 
 import sys
 import os
 import time
+import signal
+import argparse
+import datetime
 import cv2
 import numpy as np
 
@@ -26,13 +29,23 @@ from config import (
 from hand_tracker import HandTracker
 from gesture_classifier import GestureClassifier
 from sentence_processor import SentenceProcessor
+from audio_feedback import AudioManager
+from hardware_manager import HardwareManager
+
+
+def get_timestamp():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 class HeadlessISLPredictor:
     """Headless prototype processor for wall-mounted sign language device."""
 
-    def __init__(self):
-        print("[ISL Prototype] Initializing Hardware Subsystems...")
+    def __init__(self, camera_idx=CAMERA_INDEX, hold_time=GESTURE_HOLD_TIME, 
+                 confidence=CONFIDENCE_THRESHOLD, enable_cues=True):
+        print(f"[{get_timestamp()}] [ISL Prototype] Initializing Hardware & ML Subsystems...")
+
+        self.audio = AudioManager(enabled=enable_cues)
+        self.hardware = HardwareManager(enable_gpio=True)
 
         # 1. Initialize vision & classifier modules
         self.tracker = HandTracker(static_mode=False)
@@ -43,28 +56,54 @@ class HeadlessISLPredictor:
         self.sentence = []
         self.last_confirmed = ""
         self._no_hand_since = None
-        self._fps_samples = []
-        self._prev_time = time.time()
+        self._is_running = True
+        self.hold_time = hold_time
+        self.confidence_thresh = confidence
+
+        # Register physical reset button callback
+        self.hardware.register_reset_button(self.clear_sentence)
 
         # 3. Initialize Camera
-        self.cap = cv2.VideoCapture(CAMERA_INDEX)
+        self.cap = cv2.VideoCapture(camera_idx)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         if not self.cap.isOpened():
-            print("[ISL Prototype] FATAL: Camera device could not be opened!")
+            print(f"[{get_timestamp()}] [ISL Prototype] FATAL: Camera device ({camera_idx}) could not be opened!")
+            self.audio.play_error_buzz()
             sys.exit(1)
 
-        print(f"[ISL Prototype] Ready! {len(self.classifier.labels)} gestures loaded.")
-        print("[ISL Prototype] System is running headlessly (Voice Output Only).")
+        # Set Power / Ready LED
+        self.hardware.set_power_led(True)
+
+        # Play system startup chime
+        self.audio.play_startup_chime()
+
+        print(f"[{get_timestamp()}] [ISL Prototype] Ready! {len(self.classifier.labels)} gestures loaded.")
+        print(f"[{get_timestamp()}] [ISL Prototype] System running headlessly. Awaiting signs...")
+
+    def clear_sentence(self):
+        """Reset current sentence sequence (triggered by button or timeout)."""
+        print(f"[{get_timestamp()}] [ISL Prototype] Resetting sentence state.")
+        self.sentence = []
+        self.last_confirmed = ""
+        self.classifier.reset()
+        self.hardware.set_tracking_led(False)
+
+    def stop(self, *args):
+        """Signal handler for graceful termination."""
+        print(f"\n[{get_timestamp()}] [ISL Prototype] Shutdown signal received. Exiting...")
+        self._is_running = False
 
     def run(self):
         """Continuous main loop for camera processing and voice synthesis."""
-        print("[ISL Prototype] Listening for hand gestures...")
+        # Handle systemd / terminal termination signals
+        signal.signal(signal.SIGINT, self.stop)
+        signal.signal(signal.SIGTERM, self.stop)
 
         try:
-            while True:
+            while self._is_running:
                 ret, frame = self.cap.read()
                 if not ret:
                     time.sleep(0.01)
@@ -77,6 +116,7 @@ class HeadlessISLPredictor:
                 landmarks, _ = self.tracker.process(frame)
 
                 if landmarks is not None:
+                    self.hardware.set_tracking_led(True)
                     self._no_hand_since = None
                     result = self.classifier.classify(landmarks)
 
@@ -84,20 +124,27 @@ class HeadlessISLPredictor:
                         word = result['word']
                         if not self.sentence or self.sentence[-1] != word:
                             self.sentence.append(word)
-                            print(f"[ISL Prototype] Confirmed Word: [{word}] | Current Sentence: {' '.join(self.sentence)}")
+                            print(f"[{get_timestamp()}] [ISL Prototype] Confirmed Word: [{word}] | Sequence: {' '.join(self.sentence)}")
+                            
+                            # Audible and visual confirmation cue
+                            self.audio.play_confirm_beep()
+                            self.hardware.pulse_confirm()
 
                 else:
+                    self.hardware.set_tracking_led(False)
                     # No hands detected in frame
                     if self._no_hand_since is None:
                         self._no_hand_since = time.time()
                     elif time.time() - self._no_hand_since >= NO_HAND_TIMEOUT:
                         if self.sentence:
-                            print(f"\n[ISL Prototype] Finalizing Sentence: {' '.join(self.sentence)}")
+                            print(f"\n[{get_timestamp()}] [ISL Prototype] Finalizing Sentence: {' '.join(self.sentence)}")
+                            self.audio.play_sentence_finalizing()
+
                             # Process grammar & speak out via speaker
                             result = self.sentence_processor.process(self.sentence)
-                            print(f"[ISL Prototype] English Spoken: \"{result['english']}\"")
+                            print(f"[{get_timestamp()}] [ISL Prototype] English Spoken: \"{result['english']}\"")
                             if result.get('hindi'):
-                                print(f"[ISL Prototype] Hindi Meaning:  \"{result['hindi']}\"")
+                                print(f"[{get_timestamp()}] [ISL Prototype] Hindi Meaning:  \"{result['hindi']}\"")
 
                             # Clear state for next sentence
                             self.sentence = []
@@ -106,21 +153,35 @@ class HeadlessISLPredictor:
 
                         self._no_hand_since = None
 
-                # Small yield to prevent 100% single-core spin
+                # Yield briefly to keep CPU usage optimal
                 time.sleep(0.005)
 
-        except KeyboardInterrupt:
-            print("\n[ISL Prototype] Stopping system...")
         finally:
             self._cleanup()
 
     def _cleanup(self):
-        """Release camera and tracker resources."""
-        self.cap.release()
-        self.tracker.close()
-        print("[ISL Prototype] Hardware cleanly released.")
+        """Release camera, audio, and hardware resources."""
+        if hasattr(self, 'cap') and self.cap.isOpened():
+            self.cap.release()
+        if hasattr(self, 'tracker'):
+            self.tracker.close()
+        if hasattr(self, 'hardware'):
+            self.hardware.cleanup()
+        print(f"[{get_timestamp()}] [ISL Prototype] Hardware cleanly shut down.")
 
 
 if __name__ == "__main__":
-    app = HeadlessISLPredictor()
+    parser = argparse.ArgumentParser(description="Headless Standalone ISL Wall Appliance")
+    parser.add_argument("--camera", type=int, default=CAMERA_INDEX, help="Camera device index")
+    parser.add_argument("--hold-time", type=float, default=GESTURE_HOLD_TIME, help="Hold duration for confirmation (seconds)")
+    parser.add_argument("--confidence", type=float, default=CONFIDENCE_THRESHOLD, help="Confidence threshold (0.0 - 1.0)")
+    parser.add_argument("--no-cues", action="store_true", help="Disable acoustic tone cues")
+    args = parser.parse_args()
+
+    app = HeadlessISLPredictor(
+        camera_idx=args.camera,
+        hold_time=args.hold_time,
+        confidence=args.confidence,
+        enable_cues=not args.no_cues
+    )
     app.run()

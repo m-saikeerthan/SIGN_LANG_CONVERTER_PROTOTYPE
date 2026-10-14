@@ -1,120 +1,122 @@
-import cv2
-import numpy as np
-import mediapipe as mp
-import time
+"""
+Fast live ISL gesture prediction script using two-hand tracking and TFLite inference.
+"""
+
 import os
 import sys
-from tensorflow.keras.models import load_model
+import time
+import cv2
+import numpy as np
 
 # Add src to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from feature_engineer import compute_extended_features_single
-
-# Get the directory where the script is located
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(SCRIPT_DIR, "..")
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 
-# Load model
-model = load_model(os.path.join(OUTPUT_DIR, "model.h5"))
-labels = np.load(os.path.join(OUTPUT_DIR, "labels.npy"))
-mean = np.load(os.path.join(OUTPUT_DIR, "mean.npy"))
-std = np.load(os.path.join(OUTPUT_DIR, "std.npy"))
-
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=1,
-    min_detection_confidence=0.8,
-    min_tracking_confidence=0.8
+from config import (
+    CAMERA_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT,
+    COLOR_GREEN, COLOR_YELLOW, COLOR_RED, COLOR_WHITE, COLOR_DARK_BG,
+    FONT, FONT_SMALL, FONT_MEDIUM, FONT_LARGE, FONT_THICKNESS
 )
+from hand_tracker import HandTracker
+from gesture_classifier import GestureClassifier
+from sentence_processor import SentenceProcessor
 
-mp_draw = mp.solutions.drawing_utils
-cap = cv2.VideoCapture(0)
 
-sentence = []
-last_added_word = ""
-current_word = ""
-gesture_start_time = None
+def run_live():
+    print("=" * 55)
+    print("  ISL Live Prediction (1 or 2 Hands)")
+    print("  Controls: 'c' = Clear sentence | 'q' = Quit")
+    print("=" * 55)
 
-THRESHOLD = 0.90
-DIFF_THRESHOLD = 0.25
-GESTURE_HOLD_TIME = 1  # seconds
+    tracker = HandTracker(static_mode=False)
+    classifier = GestureClassifier()
+    sentence_proc = SentenceProcessor()
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
 
-    image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(image_rgb)
+    if not cap.isOpened():
+        print(f"[ISL] Error: Cannot open camera index {CAMERA_INDEX}")
+        return
 
-    prediction_text = "No clear gesture"
+    sentence = []
+    last_added_word = ""
 
-    if results.multi_hand_landmarks:
-        hand = results.multi_hand_landmarks[0]
-        mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-        # Same preprocessing as training
-        base_x = hand.landmark[0].x
-        base_y = hand.landmark[0].y
+        # Flip for natural selfie mirror
+        frame = cv2.flip(frame, 1)
+        h, w = frame.shape[:2]
 
-        data = []
-        for lm in hand.landmark:
-            data.append(lm.x - base_x)
-            data.append(lm.y - base_y)
+        landmarks, raw_hands = tracker.process(frame)
+        tracker.draw(frame, raw_hands)
 
-        input_data = np.array(data).astype(np.float32)
-        input_data = compute_extended_features_single(input_data)
-        input_data = (input_data.reshape(1, -1) - mean) / std
+        word_text = "—"
+        conf_text = "0%"
+        status_text = "No Hand"
+        status_color = COLOR_YELLOW
 
-        pred = model.predict(input_data, verbose=0)[0]
+        if landmarks is not None:
+            result = classifier.classify(landmarks)
+            status = result['status']
+            conf = result['confidence']
 
-        sorted_probs = np.sort(pred)
-        top1 = sorted_probs[-1]
-        top2 = sorted_probs[-2]
+            if result['word']:
+                word_text = result['word']
+                conf_text = f"{int(conf * 100)}%"
 
-        if top1 > THRESHOLD and (top1 - top2) > DIFF_THRESHOLD:
-            word = labels[np.argmax(pred)]
-            prediction_text = word
-
-            if word == current_word:
-                # If same word, check duration
-                if gesture_start_time is not None:
-                    elapsed = time.time() - gesture_start_time
-
-                    if elapsed >= GESTURE_HOLD_TIME:
-                        if word != last_added_word:
-                            sentence.append(word)
-                            last_added_word = word
-                        gesture_start_time = None
+            if status == 'confirmed':
+                status_text = "CONFIRMED"
+                status_color = COLOR_GREEN
+                word = result['word']
+                if not sentence or sentence[-1] != word:
+                    sentence.append(word)
+                    last_added_word = word
+            elif status == 'holding':
+                status_text = f"Holding ({int(result['hold_progress'] * 100)}%)"
+                status_color = (0, 200, 255)
             else:
-                # New gesture detected
-                current_word = word
-                gesture_start_time = time.time()
+                status_text = "Detecting..."
+                status_color = COLOR_WHITE
         else:
-            current_word = ""
-            gesture_start_time = None
+            classifier.reset()
 
-    else:
-        current_word = ""
-        gesture_start_time = None
+        # UI Overlay
+        cv2.rectangle(frame, (0, 0), (w, 60), COLOR_DARK_BG, -1)
+        cv2.putText(frame, f"Word: {word_text} ({conf_text})", (15, 30),
+                    FONT, FONT_MEDIUM, status_color, FONT_THICKNESS)
+        cv2.putText(frame, f"Status: {status_text}", (15, 52),
+                    FONT, FONT_SMALL, COLOR_WHITE, 1)
 
-    cv2.putText(frame, "Word: " + prediction_text, (20, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        # Sentence bar
+        cv2.rectangle(frame, (0, h - 45), (w, h), (20, 20, 20), -1)
+        sentence_str = " ".join(sentence) if sentence else "Sentence will appear here..."
+        cv2.putText(frame, sentence_str, (15, h - 15),
+                    FONT, FONT_MEDIUM, COLOR_WHITE, 1)
 
-    cv2.putText(frame, "Sentence: " + " ".join(sentence), (20, 100),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+        cv2.imshow("ISL Live Predictor", frame)
 
-    cv2.imshow("AI Sign Language Translator", frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('c'):
+            if sentence:
+                # Speak finalized sentence on manual clear
+                nlp_res = sentence_proc.correct_and_translate(sentence)
+                print(f"[ISL] Spoken: {nlp_res['english']}")
+                sentence_proc.speak(nlp_res['english'])
+            sentence = []
+            classifier.reset()
+        elif key == ord('q'):
+            break
 
-    key = cv2.waitKey(1) & 0xFF
+    cap.release()
+    tracker.close()
+    cv2.destroyAllWindows()
 
-    if key == ord('c'):
-        sentence = []
-        last_added_word = ""
 
-    if key == ord('q'):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    run_live()
